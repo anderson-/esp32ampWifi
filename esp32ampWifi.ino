@@ -4,6 +4,8 @@
 #include <FastLED.h>
 #include "esp_timer.h"
 
+const char* ssid = STASSID;
+const char* password = STAPSK;
 
 #define PIN_LIVINGROOM 3
 #define PIN_OFFICE     2
@@ -21,6 +23,7 @@ volatile uint8_t audioSum = 0;
 
 volatile bool interruptEnabled = false;
 volatile bool disableInterruptRequested = false;
+volatile uint32_t interruptCooldownUntilMicros = 0;
 
 volatile uint32_t lastAudioMicros = 0;
 bool hasAudio = false;
@@ -103,6 +106,7 @@ void handleSetState() {
   persistedState = newState;
   applyState(newState, true);
   standbyActive = false; // sair de standby ao comando manual
+  interruptCooldownUntilMicros = 0; // libera reativação imediata das interrupções
 
   server.send(200, "application/json", "{\"state\":\"" + persistedState + "\"}");
 }
@@ -159,11 +163,16 @@ void periodicTimerCallback(void* arg) {
   audioWindow[next] = 0;
   windowIndex = next;
 
-  // Re-enable audio interrupt even during standby so we can wake on audio
-  if (!interruptEnabled) {
+  uint32_t nowMicros = micros();
+  bool cooldownActive = interruptCooldownUntilMicros != 0 &&
+                        (int32_t)(nowMicros - interruptCooldownUntilMicros) < 0;
+
+  // Re-enable audio interrupt mesmo em standby, mas respeitando cooldown
+  if (!interruptEnabled && !cooldownActive) {
     audioWindow[windowIndex] = 0;
     attachInterrupt(PIN_AUDIO, audioISR, RISING);
     interruptEnabled = true;
+    interruptCooldownUntilMicros = 0;
   }
 
   bool newHasAudio = (audioSum >= 2);
@@ -172,16 +181,24 @@ void periodicTimerCallback(void* arg) {
   if (newHasAudio) {
     lastAudioMicros = micros();
     if (!hasAudio) {
-      hasAudio = true;
-      if (standbyActive) {
-        applyState(savedStateBeforeStandby);
-        standbyActive = false;
+      if (standbyActive && cooldownActive) {
+        // ainda estamos em cooldown: ignora tentativa de sair do standby
+        newHasAudio = false;
       } else {
-        // aplica o estado salvo apenas quando há áudio
-        if (persistedState != "mute") applyState(persistedState);
+        hasAudio = true;
+        if (standbyActive) {
+          applyState(savedStateBeforeStandby);
+          standbyActive = false;
+          interruptCooldownUntilMicros = 0;
+        } else {
+          // aplica o estado salvo apenas quando há áudio
+          if (persistedState != "mute") applyState(persistedState);
+        }
       }
     }
-  } else {
+  }
+
+  if (!newHasAudio) {
     if (hasAudio) hasAudio = false;
     uint32_t now = micros();
     uint32_t elapsed = now - lastAudioMicros;
@@ -189,8 +206,11 @@ void periodicTimerCallback(void* arg) {
 
     if (!standbyActive && lastAudioMicros != 0 && elapsed >= timeoutMicros) {
       savedStateBeforeStandby = persistedState;
+      uint32_t standbyCooldownUntil = micros() + 2000000UL;
+      interruptCooldownUntilMicros = standbyCooldownUntil;
       applyState("mute", false);
       standbyActive = true;
+      disableInterruptRequested = true;
     }
   }
 
