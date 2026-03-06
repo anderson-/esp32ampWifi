@@ -1,93 +1,465 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include <FastLED.h>
+#include "esp32-hal-rmt.h"
 #include "esp_timer.h"
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 
 const char* ssid = STASSID;
 const char* password = STAPSK;
 
-#define PIN_LIVINGROOM 3
-#define PIN_OFFICE     2
-#define PIN_AUDIO      4
-#define LED_PIN        10
+constexpr uint8_t PIN_OFFICE = 2;
+constexpr uint8_t PIN_LIVINGROOM = 3;
+constexpr uint8_t PIN_AUDIO = 4;
+constexpr uint8_t PIN_LED = 10;
+
+constexpr uint32_t AUDIO_TICK_US = 100000;
+constexpr uint32_t POWER_GUARD_MS = 2000;
+constexpr uint32_t CONNECTED_PULSE_MS = 700;
+constexpr uint32_t EVENT_BOOST_MS = 10;
+constexpr uint32_t WEB_FLASH_MS = 180;
+constexpr uint32_t DEFAULT_STANDBY_SEC = 15 * 60;
 
 WebServer server(80);
-Preferences prefs;
+Preferences preferences;
 
-CRGB leds[1];
+enum class ZoneState : uint8_t {
+  Mute,
+  LivingRoom,
+  Office,
+  Both,
+};
 
-volatile uint8_t audioWindow[10];
-volatile uint8_t windowIndex = 0;
-volatile uint8_t audioSum = 0;
+struct RgbColor {
+  uint8_t red;
+  uint8_t green;
+  uint8_t blue;
+  
+  RgbColor() : red(0), green(0), blue(0) {}
+  RgbColor(uint8_t r, uint8_t g, uint8_t b) : red(r), green(g), blue(b) {}
+  
+  bool operator==(const RgbColor& other) const {
+    return red == other.red && green == other.green && blue == other.blue;
+  }
+  
+  bool operator!=(const RgbColor& other) const {
+    return !(*this == other);
+  }
+};
 
-volatile bool interruptEnabled = false;
-volatile bool disableInterruptRequested = false;
-volatile uint32_t interruptCooldownUntilMicros = 0;
+void writeRgbPixel(uint8_t pin, uint8_t red, uint8_t green, uint8_t blue, uint8_t address = 0) {
+  static int initializedPin = -1;
+  static bool rgbReady = false;
+  if (initializedPin != pin) {
+    rgbReady = rmtInit(pin, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 10000000UL);
+    if (rgbReady) {
+      rmtSetEOT(pin, LOW);
+      initializedPin = pin;
+    }
+  }
+  if (!rgbReady) return;
 
-volatile uint32_t lastAudioMicros = 0;
-bool hasAudio = false;
-bool standbyActive = false;
+  rmt_data_t symbols[24];
+  const rmt_data_t val[2] = {rmt_data_t{8, 1, 5, 0}, rmt_data_t{4, 1, 9, 0}};
+  uint8_t symbolIndex = 0;
+  for (uint8_t channel : {green, red, blue})
+    for (uint8_t bitMask = 0x80; bitMask != 0; bitMask >>= 1)
+      symbols[symbolIndex++] = val[!(channel & bitMask)];
+  rmtWrite(pin, symbols, RMT_SYMBOLS_OF(symbols), RMT_WAIT_FOR_EVER);
+}
 
-String currentState = "mute";           // estado físico atual
-String persistedState = "mute";         // último estado salvo na flash
-String savedStateBeforeStandby = "mute";
+struct DetectionSnapshot {
+  bool audioPresent;
+  bool inputPulse;
+  uint32_t lastInputMs;
+};
 
-esp_timer_handle_t periodic_timer;
+// Forward declarations
+const char* toString(ZoneState state);
+bool parseZoneState(const String& value, ZoneState& out);
 
-CRGB nextLedColor = CRGB::Green;
-portMUX_TYPE colorLock = portMUX_INITIALIZER_UNLOCKED;
-
-volatile bool savePending = false;
-volatile bool standbySavePending = false;
-portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
-
-uint32_t standbyTimeoutSec = 15 * 60;  // tempo padrão (15min)
-
-// ------------------------------------------------------------
-
-void setPinMode(int pin, bool active) {
-  if (active) {
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-  } else {
-    pinMode(pin, INPUT_PULLUP);
+const char* toString(ZoneState state) {
+  switch (state) {
+    case ZoneState::LivingRoom: return "livingroom";
+    case ZoneState::Office: return "office";
+    case ZoneState::Both: return "both";
+    default: return "mute";
   }
 }
 
-void applyState(const String& state, bool persist = true) {
-  if (state == "livingroom") {
-    setPinMode(PIN_LIVINGROOM, true);
-    setPinMode(PIN_OFFICE, false);
-  } else if (state == "office") {
-    setPinMode(PIN_LIVINGROOM, false);
-    setPinMode(PIN_OFFICE, true);
-  } else if (state == "both") {
-    setPinMode(PIN_LIVINGROOM, true);
-    setPinMode(PIN_OFFICE, true);
-  } else {
-    setPinMode(PIN_LIVINGROOM, false);
-    setPinMode(PIN_OFFICE, false);
+bool parseZoneState(const String& value, ZoneState& out) {
+  if (value == "livingroom") {
+    out = ZoneState::LivingRoom;
+    return true;
   }
-  currentState = state;
-  if (persist) savePending = true;
+  if (value == "office") {
+    out = ZoneState::Office;
+    return true;
+  }
+  if (value == "both") {
+    out = ZoneState::Both;
+    return true;
+  }
+  if (value == "mute") {
+    out = ZoneState::Mute;
+    return true;
+  }
+  return false;
 }
 
-String getState() {
-  // retorna o estado salvo, não o físico
-  return persistedState;
+class AudioDetector {
+ public:
+  void begin() {
+    instance_ = this;
+    pinMode(PIN_AUDIO, INPUT);
+    for (uint8_t i = 0; i < kWindowSize; ++i) {
+      window_[i] = 0;
+    }
+
+    esp_timer_create_args_t timerArgs = {};
+    timerArgs.callback = &AudioDetector::onTimerThunk;
+    timerArgs.arg = this;
+    timerArgs.dispatch_method = ESP_TIMER_TASK;
+    timerArgs.name = "audio_detector";
+    if (esp_timer_create(&timerArgs, &timer_) == ESP_OK) {
+      esp_timer_start_periodic(timer_, AUDIO_TICK_US);
+    }
+  }
+
+  DetectionSnapshot snapshot() {
+    DetectionSnapshot result;
+    portENTER_CRITICAL(&lock_);
+    result.audioPresent = audioPresent_;
+    result.inputPulse = inputPulseLatched_;
+    result.lastInputMs = lastInputMs_;
+    inputPulseLatched_ = false;
+    portEXIT_CRITICAL(&lock_);
+    return result;
+  }
+
+ private:
+  static constexpr uint8_t kWindowSize = 10;
+  static AudioDetector* instance_;
+
+  volatile uint8_t window_[kWindowSize] = {0};
+  volatile uint8_t windowIndex_ = 0;
+  volatile uint8_t windowSum_ = 0;
+  volatile bool interruptEnabled_ = false;
+  volatile bool disableInterruptRequested_ = false;
+  volatile bool rawPulseLatched_ = false;
+  volatile bool inputPulseLatched_ = false;
+  volatile bool audioPresent_ = false;
+  volatile uint32_t lastInputMs_ = 0;
+  esp_timer_handle_t timer_ = nullptr;
+  portMUX_TYPE lock_ = portMUX_INITIALIZER_UNLOCKED;
+
+  static void IRAM_ATTR onAudioInterrupt() {
+    if (instance_ != nullptr) {
+      instance_->handleInterrupt();
+    }
+  }
+
+  static void onTimerThunk(void* arg) {
+    static_cast<AudioDetector*>(arg)->onTimer();
+  }
+
+  void IRAM_ATTR handleInterrupt() {
+    portENTER_CRITICAL_ISR(&lock_);
+    const uint8_t idx = windowIndex_;
+    if (window_[idx] == 0) {
+      window_[idx] = 1;
+      ++windowSum_;
+    }
+    lastInputMs_ = static_cast<uint32_t>(micros() / 1000ULL);
+    rawPulseLatched_ = true;
+    disableInterruptRequested_ = true;
+    portEXIT_CRITICAL_ISR(&lock_);
+  }
+
+  void onTimer() {
+    portENTER_CRITICAL(&lock_);
+
+    if (disableInterruptRequested_) {
+      detachInterrupt(PIN_AUDIO);
+      interruptEnabled_ = false;
+      disableInterruptRequested_ = false;
+    }
+
+    const uint8_t nextIndex = (windowIndex_ + 1) % kWindowSize;
+    const uint8_t oldValue = window_[nextIndex];
+    if (oldValue > 0) {
+      windowSum_ -= oldValue;
+    }
+    window_[nextIndex] = 0;
+    windowIndex_ = nextIndex;
+
+    if (!interruptEnabled_) {
+      attachInterrupt(PIN_AUDIO, &AudioDetector::onAudioInterrupt, RISING);
+      interruptEnabled_ = true;
+    }
+
+    const bool nextAudioPresent = windowSum_ >= 2;
+    const bool nextInputPulse = rawPulseLatched_;
+    rawPulseLatched_ = false;
+    inputPulseLatched_ = inputPulseLatched_ || nextInputPulse;
+    audioPresent_ = nextAudioPresent;
+
+    portEXIT_CRITICAL(&lock_);
+  }
+};
+
+AudioDetector* AudioDetector::instance_ = nullptr;
+
+class AmplifierController {
+ public:
+  void begin() {
+    pinMode(PIN_LIVINGROOM, INPUT_PULLUP);
+    pinMode(PIN_OFFICE, INPUT_PULLUP);
+    applyPhysical(ZoneState::Mute);
+  }
+
+  void applyPhysical(ZoneState state) {
+    switch (state) {
+      case ZoneState::LivingRoom:
+        setRelay(PIN_LIVINGROOM, true);
+        setRelay(PIN_OFFICE, false);
+        break;
+      case ZoneState::Office:
+        setRelay(PIN_LIVINGROOM, false);
+        setRelay(PIN_OFFICE, true);
+        break;
+      case ZoneState::Both:
+        setRelay(PIN_LIVINGROOM, true);
+        setRelay(PIN_OFFICE, true);
+        break;
+      case ZoneState::Mute:
+      default:
+        setRelay(PIN_LIVINGROOM, false);
+        setRelay(PIN_OFFICE, false);
+        break;
+    }
+    physicalState_ = state;
+  }
+
+  ZoneState physicalState() const {
+    return physicalState_;
+  }
+
+ private:
+  ZoneState physicalState_ = ZoneState::Mute;
+
+  void setRelay(uint8_t pin, bool active) {
+    if (active) {
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, LOW);
+    } else {
+      pinMode(pin, INPUT_PULLUP);
+    }
+  }
+};
+
+class LedAnimator {
+ public:
+  void begin() {
+    writeRgbPixel(PIN_LED, 0, 0, 0);
+  }
+
+  void startConnectedPulse(uint32_t nowMs) {
+    connectedPulseUntilMs_ = nowMs + CONNECTED_PULSE_MS;
+  }
+
+  void triggerBoost(uint32_t nowMs) {
+    if (nowMs + EVENT_BOOST_MS > boostUntilMs_) {
+      boostUntilMs_ = nowMs + EVENT_BOOST_MS;
+    }
+  }
+
+  void triggerWebFlash(uint32_t nowMs) {
+    if (nowMs + WEB_FLASH_MS > webFlashUntilMs_) {
+      webFlashUntilMs_ = nowMs + WEB_FLASH_MS;
+    }
+  }
+
+  void render(uint32_t nowMs, bool wifiConnected, const RgbColor& baseColor) {
+    RgbColor output;
+
+    if (!wifiConnected) {
+      output = scaled(RgbColor(0, 0, 255), slowPulse(nowMs, 0.04f, 0.22f));
+    } else if (nowMs < connectedPulseUntilMs_) {
+      output = scaled(RgbColor(0, 0, 255), fastPulse(nowMs, 0.08f, 0.35f));
+    } else if (nowMs < webFlashUntilMs_) {
+      output = scaled(RgbColor(0, 0, 255), 0.50f);
+    } else {
+      const float brightness = nowMs < boostUntilMs_ ? 0.10f : 0.05f;
+      output = scaled(baseColor, brightness);
+    }
+
+    if (output != lastColor_) {
+      writeRgbPixel(PIN_LED, output.red, output.green, output.blue);
+      lastColor_ = output;
+    }
+  }
+
+ private:
+  RgbColor lastColor_ = RgbColor(0, 0, 0);
+  uint32_t connectedPulseUntilMs_ = 0;
+  uint32_t boostUntilMs_ = 0;
+  uint32_t webFlashUntilMs_ = 0;
+
+  static RgbColor scaled(const RgbColor& color, float brightness) {
+    brightness = constrain(brightness, 0.0f, 1.0f);
+    return RgbColor(
+      static_cast<uint8_t>(color.red * brightness),
+      static_cast<uint8_t>(color.green * brightness),
+      static_cast<uint8_t>(color.blue * brightness)
+    );
+  }
+
+  static float slowPulse(uint32_t nowMs, float minValue, float maxValue) {
+    const float phase = (nowMs % 2200UL) / 2200.0f;
+    const float wave = 0.5f - 0.5f * cosf(phase * 2.0f * PI);
+    return minValue + (maxValue - minValue) * wave;
+  }
+
+  static float fastPulse(uint32_t nowMs, float minValue, float maxValue) {
+    const float phase = (nowMs % 280UL) / 280.0f;
+    const float wave = 0.5f - 0.5f * cosf(phase * 2.0f * PI);
+    return minValue + (maxValue - minValue) * wave;
+  }
+};
+
+struct RuntimeState {
+  ZoneState preferredState = ZoneState::Mute;
+  ZoneState stateBeforeStandby = ZoneState::Mute;
+  uint32_t standbyTimeoutSec = DEFAULT_STANDBY_SEC;
+  bool audioPresent = false;
+  bool standbyActive = false;
+  bool wifiConnected = false;
+  bool previousWifiConnected = false;
+  bool saveStatePending = false;
+  bool saveStandbyPending = false;
+  uint32_t lastAudioMs = 0;
+  uint32_t lastInputMs = 0;
+  uint32_t powerGuardUntilMs = 0;
+};
+
+AudioDetector detector;
+AmplifierController amplifier;
+LedAnimator led;
+RuntimeState runtime;
+
+RgbColor mixColor(const RgbColor& a, const RgbColor& b, float ratio) {
+  ratio = constrain(ratio, 0.0f, 1.0f);
+  return RgbColor(
+    static_cast<uint8_t>(a.red + (b.red - a.red) * ratio),
+    static_cast<uint8_t>(a.green + (b.green - a.green) * ratio),
+    static_cast<uint8_t>(a.blue + (b.blue - a.blue) * ratio)
+  );
 }
 
-// ------------------------------------------------------------
-// Endpoints
+RgbColor idleGradientColor(uint32_t nowMs) {
+  if (runtime.standbyTimeoutSec == 0) {
+    return RgbColor(255, 0, 0);
+  }
+
+  const uint32_t elapsedMs = nowMs > runtime.lastAudioMs ? nowMs - runtime.lastAudioMs : 0;
+  const float progress = constrain(static_cast<float>(elapsedMs) / (runtime.standbyTimeoutSec * 1000.0f), 0.0f, 1.0f);
+
+  if (progress < 0.5f) {
+    return mixColor(RgbColor(0, 255, 0), RgbColor(255, 255, 0), progress / 0.5f);
+  }
+  return mixColor(RgbColor(255, 255, 0), RgbColor(255, 0, 0), (progress - 0.5f) / 0.5f);
+}
+
+RgbColor currentBaseColor(uint32_t nowMs) {
+  if (!runtime.wifiConnected) {
+    return RgbColor(0, 0, 255);
+  }
+  if (runtime.audioPresent) {
+    return RgbColor(0, 255, 0);
+  }
+  if (runtime.standbyActive || runtime.preferredState == ZoneState::Mute) {
+    return RgbColor(255, 0, 0);
+  }
+  return idleGradientColor(nowMs);
+}
+
+void persistIfNeeded() {
+  if (runtime.saveStatePending) {
+    preferences.putString("state", toString(runtime.preferredState));
+    runtime.saveStatePending = false;
+  }
+  if (runtime.saveStandbyPending) {
+    preferences.putUInt("stby_sec", runtime.standbyTimeoutSec);
+    runtime.saveStandbyPending = false;
+  }
+}
+
+ZoneState desiredPhysicalState(uint32_t nowMs) {
+  if (nowMs < runtime.powerGuardUntilMs) {
+    return ZoneState::Mute;
+  }
+  if (runtime.standbyActive) {
+    return ZoneState::Mute;
+  }
+  return runtime.preferredState;
+}
+
+void applyPhysicalStateIfNeeded(uint32_t nowMs) {
+  const ZoneState target = desiredPhysicalState(nowMs);
+  if (target != amplifier.physicalState()) {
+    amplifier.applyPhysical(target);
+    led.triggerBoost(nowMs);
+  }
+}
+
+void processDetection(uint32_t nowMs) {
+  DetectionSnapshot snapshot = detector.snapshot();
+
+  if (snapshot.inputPulse) {
+    runtime.lastInputMs = snapshot.lastInputMs;
+    led.triggerBoost(nowMs);
+  }
+
+  const bool previousAudio = runtime.audioPresent;
+  runtime.audioPresent = snapshot.audioPresent;
+
+  if (runtime.audioPresent) {
+    runtime.lastAudioMs = nowMs;
+    if (!previousAudio) {
+      runtime.standbyActive = false;
+      led.triggerBoost(nowMs);
+    }
+    return;
+  }
+
+  if (previousAudio) {
+    runtime.lastAudioMs = nowMs;
+  }
+
+  if (!runtime.standbyActive && runtime.lastAudioMs > 0) {
+    const uint32_t silentMs = nowMs - runtime.lastAudioMs;
+    if (silentMs >= runtime.standbyTimeoutSec * 1000UL) {
+      runtime.stateBeforeStandby = runtime.preferredState;
+      runtime.standbyActive = true;
+      led.triggerBoost(nowMs);
+    }
+  }
+}
+
+String statePayload() {
+  return String("{\"state\":\"") + toString(runtime.preferredState) + "\"}";
+}
 
 void handleRoot() {
   server.send(200, "text/plain", "ESP32-C3 Audio Switch");
 }
 
 void handleGetState() {
-  String resp = "{\"state\":\"" + getState() + "\"}";
-  server.send(200, "application/json", resp);
+  server.send(200, "application/json", statePayload());
 }
 
 void handleSetState() {
@@ -95,214 +467,148 @@ void handleSetState() {
     server.send(400, "text/plain", "Missing state parameter");
     return;
   }
-  String newState = server.arg("state");
-  if (newState != "livingroom" && newState != "office" &&
-      newState != "both" && newState != "mute") {
+
+  ZoneState nextState;
+  if (!parseZoneState(server.arg("state"), nextState)) {
     server.send(400, "text/plain", "Invalid state");
     return;
   }
 
-  // aplica imediatamente e agenda persistência no loop
-  persistedState = newState;
-  applyState(newState, true);
-  standbyActive = false; // sair de standby ao comando manual
-  interruptCooldownUntilMicros = 0; // libera reativação imediata das interrupções
+  runtime.preferredState = nextState;
+  runtime.stateBeforeStandby = nextState;
+  runtime.standbyActive = false;
+  runtime.saveStatePending = true;
+  const uint32_t nowMs = millis();
+  led.triggerBoost(nowMs);
+  led.triggerWebFlash(nowMs);
+  applyPhysicalStateIfNeeded(nowMs);
 
-  server.send(200, "application/json", "{\"state\":\"" + persistedState + "\"}");
+  server.send(200, "application/json", statePayload());
 }
 
-void handleStandbyConfig() {
+void handleStandby() {
   if (server.method() == HTTP_GET) {
-    String resp = "{\"standby_timeout_sec\":" + String(standbyTimeoutSec) + "}";
-    server.send(200, "application/json", resp);
-  } else if (server.method() == HTTP_POST) {
-    if (!server.hasArg("timeout")) {
-      server.send(400, "text/plain", "Missing timeout parameter");
-      return;
-    }
-    uint32_t newTimeout = server.arg("timeout").toInt();
-    if (newTimeout <= 1 || newTimeout > 24UL * 3600UL) {
-      server.send(400, "text/plain", "Timeout out of range");
-      return;
-    }
-    standbyTimeoutSec = newTimeout;
-    standbySavePending = true; // salva no loop() para evitar concorrência no NVS
-    String resp = "{\"standby_timeout_sec\":" + String(standbyTimeoutSec) + "}";
-    server.send(200, "application/json", resp);
-  } else {
+    server.send(200, "application/json", String("{\"standby_timeout_sec\":") + runtime.standbyTimeoutSec + "}");
+    return;
+  }
+
+  if (server.method() != HTTP_POST) {
     server.send(405, "text/plain", "Method not allowed");
+    return;
   }
+
+  if (!server.hasArg("timeout")) {
+    server.send(400, "text/plain", "Missing timeout parameter");
+    return;
+  }
+
+  const uint32_t newTimeout = static_cast<uint32_t>(server.arg("timeout").toInt());
+  if (newTimeout < 1 || newTimeout > 86400UL) {
+    server.send(400, "text/plain", "Timeout out of range");
+    return;
+  }
+
+  runtime.standbyTimeoutSec = newTimeout;
+  runtime.saveStandbyPending = true;
+  const uint32_t nowMs = millis();
+  led.triggerWebFlash(nowMs);
+  server.send(200, "application/json", String("{\"standby_timeout_sec\":") + runtime.standbyTimeoutSec + "}");
 }
 
-// ------------------------------------------------------------
-
-void IRAM_ATTR audioISR() {
-  uint8_t idx = windowIndex;
-  if (audioWindow[idx] == 0) {
-    audioWindow[idx] = 1;
-    audioSum++;
-  }
-  lastAudioMicros = micros();
-  disableInterruptRequested = true;
-}
-
-// ------------------------------------------------------------
-
-void periodicTimerCallback(void* arg) {
-  portENTER_CRITICAL(&spinlock);
-
-  if (disableInterruptRequested) {
-    detachInterrupt(PIN_AUDIO);
-    interruptEnabled = false;
-    disableInterruptRequested = false;
-  }
-
-  uint8_t next = (windowIndex + 1) % 10;
-  uint8_t old = audioWindow[next];
-  if (old) audioSum -= old;
-  audioWindow[next] = 0;
-  windowIndex = next;
-
-  uint32_t nowMicros = micros();
-  bool cooldownActive = interruptCooldownUntilMicros != 0 &&
-                        (int32_t)(nowMicros - interruptCooldownUntilMicros) < 0;
-
-  // Re-enable audio interrupt mesmo em standby, mas respeitando cooldown
-  if (!interruptEnabled && !cooldownActive) {
-    audioWindow[windowIndex] = 0;
-    attachInterrupt(PIN_AUDIO, audioISR, RISING);
-    interruptEnabled = true;
-    interruptCooldownUntilMicros = 0;
-  }
-
-  bool newHasAudio = (audioSum >= 2);
-  portEXIT_CRITICAL(&spinlock);
-
-  if (newHasAudio) {
-    lastAudioMicros = micros();
-    if (!hasAudio) {
-      if (standbyActive && cooldownActive) {
-        // ainda estamos em cooldown: ignora tentativa de sair do standby
-        newHasAudio = false;
-      } else {
-        hasAudio = true;
-        if (standbyActive) {
-          applyState(savedStateBeforeStandby);
-          standbyActive = false;
-          interruptCooldownUntilMicros = 0;
-        } else {
-          // aplica o estado salvo apenas quando há áudio
-          if (persistedState != "mute") applyState(persistedState);
-        }
-      }
-    }
-  }
-
-  if (!newHasAudio) {
-    if (hasAudio) hasAudio = false;
-    uint32_t now = micros();
-    uint32_t elapsed = now - lastAudioMicros;
-    uint32_t timeoutMicros = standbyTimeoutSec * 1000000UL;
-
-    if (!standbyActive && lastAudioMicros != 0 && elapsed >= timeoutMicros) {
-      savedStateBeforeStandby = persistedState;
-      uint32_t standbyCooldownUntil = micros() + 2000000UL;
-      interruptCooldownUntilMicros = standbyCooldownUntil;
-      applyState("mute", false);
-      standbyActive = true;
-      disableInterruptRequested = true;
-    }
-  }
-
-  portENTER_CRITICAL(&colorLock);
-  nextLedColor = hasAudio ? CRGB::Green : CRGB::Red;
-  portEXIT_CRITICAL(&colorLock);
-}
-
-// ------------------------------------------------------------
-
-void setup() {
-  Serial.begin(115200);
-  pinMode(PIN_LIVINGROOM, INPUT_PULLUP);
-  pinMode(PIN_OFFICE, INPUT_PULLUP);
-  pinMode(PIN_AUDIO, INPUT);
-
-  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, 1);
-  leds[0] = CRGB::Blue;
-  FastLED.show();
-
-  prefs.begin("audio-mode", false);
-  persistedState = prefs.getString("state", "mute");
-  // NVS keys have a 15-char limit; use a short key
-  standbyTimeoutSec = prefs.getUInt("stby_sec", 15 * 60);
-  Serial.printf("Standby timeout loaded: %lu sec\n", (unsigned long)standbyTimeoutSec);
-
-  // sempre começa mudo (físico)
-  applyState("mute", false);
-  currentState = "mute";
-  savedStateBeforeStandby = persistedState;
-
+void setupWifi() {
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+}
 
+void setupOTA() {
+  // Port defaults to 3232
+  // ArduinoOTA.setPort(3232);
+
+  // Hostname defaults to esp3232-[MAC]
+  // ArduinoOTA.setHostname("myesp32");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword("admin");
+
+  // Password can be set with it's md5 value as well
+  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+}
+
+void setupWeb() {
   server.on("/", handleRoot);
   server.on("/state", HTTP_GET, handleGetState);
   server.on("/state", HTTP_POST, handleSetState);
-  server.on("/standby", HTTP_GET, handleStandbyConfig);
-  server.on("/standby", HTTP_POST, handleStandbyConfig);
+  server.on("/standby", HTTP_GET, handleStandby);
+  server.on("/standby", HTTP_POST, handleStandby);
   server.begin();
-
-  for (int i = 0; i < 10; ++i) audioWindow[i] = 0;
-  windowIndex = 0;
-  audioSum = 0;
-  interruptEnabled = false;
-  lastAudioMicros = 0;
-  hasAudio = false;
-  standbyActive = false;
-
-  esp_timer_create_args_t periodic_timer_args = {};
-  periodic_timer_args.callback = &periodicTimerCallback;
-  periodic_timer_args.arg = NULL;
-  periodic_timer_args.dispatch_method = ESP_TIMER_TASK;
-  periodic_timer_args.name = "audio_periodic";
-  esp_err_t _timer_err = esp_timer_create(&periodic_timer_args, &periodic_timer);
-  if (_timer_err != ESP_OK) {
-    Serial.printf("esp_timer_create failed: %d\n", (int)_timer_err);
-  } else {
-    esp_timer_start_periodic(periodic_timer, 100000);
-    Serial.println("Audio detection timer started (10Hz).");
-  }
 }
 
-// ------------------------------------------------------------
+void loadSettings() {
+  preferences.begin("audio-mode", false);
+
+  ZoneState loadedState = ZoneState::Mute;
+  parseZoneState(preferences.getString("state", "mute"), loadedState);
+  runtime.preferredState = loadedState;
+  runtime.stateBeforeStandby = loadedState;
+  runtime.standbyTimeoutSec = preferences.getUInt("stby_sec", DEFAULT_STANDBY_SEC);
+}
+
+void updateWifiStatus(uint32_t nowMs) {
+  runtime.wifiConnected = WiFi.status() == WL_CONNECTED;
+  if (runtime.wifiConnected && !runtime.previousWifiConnected) {
+    led.startConnectedPulse(nowMs);
+  }
+  runtime.previousWifiConnected = runtime.wifiConnected;
+}
+
+void setup() {
+  Serial.begin(115200);
+  amplifier.begin();
+  led.begin();
+  loadSettings();
+  detector.begin();
+  runtime.powerGuardUntilMs = millis() + POWER_GUARD_MS;
+  setupWifi();
+  setupOTA();
+  setupWeb();
+}
 
 void loop() {
+  const uint32_t nowMs = millis();
+
+  updateWifiStatus(nowMs);
+  processDetection(nowMs);
+  applyPhysicalStateIfNeeded(nowMs);
+  persistIfNeeded();
+  led.render(nowMs, runtime.wifiConnected, currentBaseColor(nowMs));
   server.handleClient();
-
-  CRGB localColor;
-  portENTER_CRITICAL(&colorLock);
-  localColor = nextLedColor;
-  portEXIT_CRITICAL(&colorLock);
-
-  if (leds[0] != localColor) {
-    leds[0] = localColor;
-    FastLED.show();
-  }
-
-  if (savePending) {
-    prefs.putString("state", currentState);
-    savePending = false;
-  }
-
-  if (standbySavePending) {
-    size_t w = prefs.putUInt("stby_sec", standbyTimeoutSec);
-    Serial.printf("Standby timeout saved to NVS: %lu sec (bytes=%u)\n",
-                  (unsigned long)standbyTimeoutSec, (unsigned)w);
-    standbySavePending = false;
-  }
+  ArduinoOTA.handle();
 }
